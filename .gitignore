@@ -1,0 +1,35 @@
+# Credentials and local environments
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Python caches and tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated experiment artifacts
+results/
+inference_results/
+evaluation_results/
+batch_logs/
+logs/
+evaluation_summary.json
+results.json
+
+# Historical local outputs (not part of the reproducible package)
+claude_gpt/
+evaluation/
+gemini/
+kimi/
+minimax/
+qwen/
+
+# Local editor and OS files
+.DS_Store
+.idea/
+.vscode/
