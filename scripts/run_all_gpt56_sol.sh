@@ -12,9 +12,28 @@ if ! [[ "$MAX_JOBS" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 mkdir -p "$LOG_DIR"
-running=0
+pids=()
 failed=0
 total=0
+
+# Bash 3.2 (still shipped by default on macOS) does not support `wait -n`.
+# Keep a FIFO of child PIDs and wait for the oldest job whenever the configured
+# concurrency limit is reached. This may wait for an older, slower job while a
+# newer one has already completed, but it remains portable and never exceeds
+# MAX_JOBS.
+wait_for_oldest_job() {
+  local pid="${pids[0]}"
+
+  if ! wait "$pid"; then
+    failed=$((failed + 1))
+  fi
+
+  if (( ${#pids[@]} == 1 )); then
+    pids=()
+  else
+    pids=("${pids[@]:1}")
+  fi
+}
 
 while IFS=$'\t' read -r benchmark setting turn script; do
   [[ "$benchmark" == "benchmark" ]] && continue
@@ -26,17 +45,15 @@ while IFS=$'\t' read -r benchmark setting turn script; do
   else
     bash "$ROOT_DIR/$script" >"$log_file" 2>&1
   fi &
-  running=$((running + 1))
+  pids+=("$!")
 
-  if (( running >= MAX_JOBS )); then
-    wait -n || failed=$((failed + 1))
-    running=$((running - 1))
+  if (( ${#pids[@]} >= MAX_JOBS )); then
+    wait_for_oldest_job
   fi
 done < "$MANIFEST"
 
-while (( running > 0 )); do
-  wait -n || failed=$((failed + 1))
-  running=$((running - 1))
+while (( ${#pids[@]} > 0 )); do
+  wait_for_oldest_job
 done
 
 echo "Completed $total jobs; failures: $failed"
