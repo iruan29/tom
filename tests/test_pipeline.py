@@ -18,7 +18,10 @@ class FakeCompletions:
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        message = SimpleNamespace(content=next(self.responses))
+        response = next(self.responses)
+        if isinstance(response, BaseException):
+            raise response
+        message = SimpleNamespace(content=response)
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
@@ -64,6 +67,30 @@ class ConcurrentJudgeCompletions(ConcurrentCompletions):
 
 
 class InferenceContractTests(unittest.TestCase):
+    @staticmethod
+    def make_dataset(temp_path, count):
+        trajectory_path = temp_path / "trajectory.json"
+        trajectory_path.write_text('{"trajectory": []}', encoding="utf-8")
+        dataset = []
+        for index in range(count):
+            dataset.append({
+                "id": f"test_{index}",
+                "domain": "test",
+                "observation": "observation",
+                "explicit_instruction": "instruction",
+                "trajectory": str(trajectory_path),
+                "user_profile": "profile",
+                "user_latent_belief": "belief",
+                "true_latent_state": "state",
+                "root_cause_of_misconception": "cause",
+                "rubrics": {
+                    "correct_resolution": [{"criterion": "criterion"}]
+                },
+            })
+        dataset_path = temp_path / "dataset.json"
+        dataset_path.write_text(json.dumps(dataset), encoding="utf-8")
+        return dataset_path, dataset
+
     def test_organized_data_resolves_legacy_trajectory_reference(self):
         with patch.object(inference, "TRAJECTORIES_DIR", Path("data/trajectories")):
             trajectory = inference.load_trajectory(
@@ -138,26 +165,7 @@ class InferenceContractTests(unittest.TestCase):
     def test_main_runs_multiple_requests_concurrently(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
-            trajectory_path = temp_path / "trajectory.json"
-            trajectory_path.write_text('{"trajectory": []}', encoding="utf-8")
-            dataset = []
-            for index in range(4):
-                dataset.append({
-                    "id": f"test_{index}",
-                    "domain": "test",
-                    "observation": "observation",
-                    "explicit_instruction": "instruction",
-                    "trajectory": str(trajectory_path),
-                    "user_profile": "profile",
-                    "user_latent_belief": "belief",
-                    "true_latent_state": "state",
-                    "root_cause_of_misconception": "cause",
-                    "rubrics": {
-                        "correct_resolution": [{"criterion": "criterion"}]
-                    },
-                })
-            dataset_path = temp_path / "dataset.json"
-            dataset_path.write_text(json.dumps(dataset), encoding="utf-8")
+            dataset_path, dataset = self.make_dataset(temp_path, 4)
             completions = ConcurrentCompletions()
             fake_client = SimpleNamespace(
                 chat=SimpleNamespace(completions=completions)
@@ -180,6 +188,105 @@ class InferenceContractTests(unittest.TestCase):
             output_files = list((temp_path / "results").glob("*.json"))
             self.assertEqual(len(output_files), 1)
             self.assertEqual(len(json.loads(output_files[0].read_text())), 4)
+
+    def test_resume_requests_only_missing_instances(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            dataset_path, dataset = self.make_dataset(temp_path, 4)
+            output_dir = temp_path / "results"
+            output_dir.mkdir()
+            prefix = inference.experiment_file_prefix(
+                dataset_path, "fake-model", "direct_solution", 0
+            )
+            output_path = output_dir / f"{prefix}.json"
+            existing = {
+                "instance_id": dataset[0]["id"],
+                "inference_mode": "direct_solution",
+                "inference": {"correct_resolution": "existing solution"},
+            }
+            output_path.write_text(json.dumps([existing]), encoding="utf-8")
+
+            client = FakeClient([
+                json.dumps({"correct_resolution": f"solution {index}"})
+                for index in range(1, 4)
+            ])
+            argv = [
+                "inference.py",
+                "--input", str(dataset_path),
+                "--model", "fake-model",
+                "--steps", "0",
+                "--mode", "direct_solution",
+                "--workers", "1",
+                "--output-dir", str(output_dir),
+                "--resume",
+            ]
+            with patch.object(inference, "OpenAI", return_value=client), patch(
+                "sys.argv", argv
+            ):
+                inference.main()
+
+            self.assertEqual(len(client.chat.completions.calls), 3)
+            results = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [result["instance_id"] for result in results],
+                [instance["id"] for instance in dataset],
+            )
+
+            with patch.object(inference, "OpenAI") as openai_constructor, patch(
+                "sys.argv", argv
+            ):
+                inference.main()
+            openai_constructor.assert_not_called()
+
+    def test_failed_run_exits_nonzero_and_resume_fills_the_gap(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            dataset_path, dataset = self.make_dataset(temp_path, 3)
+            output_dir = temp_path / "results"
+            argv = [
+                "inference.py",
+                "--input", str(dataset_path),
+                "--model", "fake-model",
+                "--steps", "0",
+                "--mode", "direct_solution",
+                "--workers", "1",
+                "--output-dir", str(output_dir),
+                "--resume",
+            ]
+            first_client = FakeClient([
+                json.dumps({"correct_resolution": "solution 0"}),
+                RuntimeError("simulated request failure"),
+                json.dumps({"correct_resolution": "solution 2"}),
+            ])
+            with patch.object(inference, "OpenAI", return_value=first_client), patch(
+                "sys.argv", argv
+            ), self.assertRaisesRegex(SystemExit, "1"):
+                inference.main()
+
+            prefix = inference.experiment_file_prefix(
+                dataset_path, "fake-model", "direct_solution", 0
+            )
+            output_path = output_dir / f"{prefix}.json"
+            partial = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [result["instance_id"] for result in partial],
+                [dataset[0]["id"], dataset[2]["id"]],
+            )
+
+            retry_client = FakeClient([
+                json.dumps({"correct_resolution": "retried solution"})
+            ])
+            with patch.object(inference, "OpenAI", return_value=retry_client), patch(
+                "sys.argv", argv
+            ):
+                inference.main()
+
+            self.assertEqual(len(retry_client.chat.completions.calls), 1)
+            completed = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [result["instance_id"] for result in completed],
+                [instance["id"] for instance in dataset],
+            )
 
 
 class EvaluationContractTests(unittest.TestCase):

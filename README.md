@@ -73,6 +73,21 @@ maximum possible request concurrency. Results are written under
 `results/inference/gpt-5.6-sol/` and logs under
 `results/logs/gpt-5.6-sol/`; both are ignored by Git.
 
+Resume is enabled by default. Re-running the same command reuses the matching
+result file, skips valid completed instances, and requests only missing or failed
+instances. Each successful result is written atomically, so an interrupted run
+can safely continue:
+
+```bash
+REQUEST_WORKERS=32 MAX_JOBS=8 bash scripts/run_all_gpt56_sol.sh
+```
+
+Set `RESUME=0` to deliberately start a new timestamped result file instead:
+
+```bash
+RESUME=0 REQUEST_WORKERS=8 MAX_JOBS=1 bash scripts/run_all_gpt56_sol.sh
+```
+
 Useful overrides:
 
 ```bash

@@ -30,8 +30,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODEL_NAME="${MODEL_NAME:-gpt-5.6-sol}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 REQUEST_WORKERS="${REQUEST_WORKERS:-8}"
+RESUME="${RESUME:-1}"
 SAFE_MODEL_NAME="${MODEL_NAME//\//_}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/results/inference/$SAFE_MODEL_NAME}"
+
+case "$RESUME" in
+  0|1) ;;
+  *) echo "RESUME must be 0 or 1" >&2; exit 2 ;;
+esac
 
 command=(
   "$PYTHON_BIN" "$ROOT_DIR/inference.py"
@@ -42,8 +48,12 @@ command=(
   --workers "$REQUEST_WORKERS"
   --output-dir "$OUTPUT_DIR"
   --trajectories-dir "$ROOT_DIR/data/trajectories"
-  "$@"
 )
+
+if [[ "$RESUME" == "1" ]]; then
+  command+=(--resume)
+fi
+command+=("$@")
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   printf '%q ' "${command[@]}"

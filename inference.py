@@ -32,6 +32,7 @@ import time
 import re
 import argparse
 import base64
+import tempfile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -93,6 +94,100 @@ INFERENCE_MODES = {
 }
 
 COT_INSTRUCTION = "Think step by step carefully before giving your answer."
+
+
+def atomic_write_json(path, data):
+    """Atomically replace a JSON file so interrupted writes remain recoverable."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def experiment_file_prefix(input_file, inference_model, inference_mode, step_num):
+    """Return the filename prefix shared by new and legacy timestamped runs."""
+    safe_model_name = (
+        inference_model.replace('/', '_').replace(':', '_').replace(' ', '_')
+    )
+    input_data_name = Path(input_file).stem
+    return (
+        f"inference_{input_data_name}_{safe_model_name}_"
+        f"{inference_mode}_step{step_num}"
+    )
+
+
+def select_output_file(output_dir, prefix, resume):
+    """Select a stable result file, reusing a legacy timestamped run if present."""
+    output_dir = Path(output_dir)
+    if not resume:
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        return output_dir / f"{prefix}_{timestamp}.json"
+
+    canonical = output_dir / f"{prefix}.json"
+    if canonical.exists():
+        return canonical
+
+    legacy_candidates = sorted(
+        (
+            path
+            for path in output_dir.glob("*.json")
+            if path.name.startswith(f"{prefix}_")
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for candidate in legacy_candidates:
+        try:
+            existing = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.warning(f"Ignoring unreadable resume candidate: {candidate}")
+            continue
+        if isinstance(existing, list):
+            return candidate
+        logger.warning(f"Ignoring non-list resume candidate: {candidate}")
+    return canonical
+
+
+def load_completed_results(output_file, inference_mode, dataset_ids):
+    """Load valid completed instances, dropping corrupt, duplicate, or foreign rows."""
+    output_file = Path(output_file)
+    if not output_file.exists():
+        return {}
+    try:
+        existing = json.loads(output_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        logger.warning(f"Could not load resume file {output_file}: {error}")
+        return {}
+    if not isinstance(existing, list):
+        logger.warning(f"Resume file is not a JSON list: {output_file}")
+        return {}
+
+    completed = {}
+    for result in existing:
+        if not isinstance(result, dict):
+            continue
+        instance_id = result.get("instance_id")
+        if instance_id not in dataset_ids:
+            continue
+        try:
+            validate_inference_result(result.get("inference"), inference_mode)
+        except ValueError:
+            logger.warning(
+                f"Retrying incomplete result for instance {instance_id!r}"
+            )
+            continue
+        completed[instance_id] = result
+    return completed
 
 
 def encode_image_to_base64(image_id: str) -> str:
@@ -477,6 +572,7 @@ Example usage:
   python inference.py -i data/benchmarks/pref-benchmark.json -m gpt-5.6-sol -s 5
   python inference.py -i data/benchmarks/swe-benchmark.json -m gpt-5.6-sol -s 10 --mode direct_solution
   python inference.py -i data/benchmarks/culture-benchmark.json -m gpt-5.6-sol -s 0 --mode cot_solution
+  python inference.py -i data/benchmarks/culture-benchmark.json -m gpt-5.6-sol -s 0 --resume
         """
     )
     parser.add_argument(
@@ -533,6 +629,14 @@ Example usage:
         default=None,
         help='Base directory for trajectory files (overrides TRAJECTORIES_DIR env var)'
     )
+    parser.add_argument(
+        '--resume',
+        action='store_true',
+        help=(
+            'Reuse a matching result file, skip valid completed instances, '
+            'and request only missing instances'
+        )
+    )
 
     args = parser.parse_args()
     input_file = args.input
@@ -556,12 +660,10 @@ Example usage:
     if args.trajectories_dir:
         TRAJECTORIES_DIR = Path(args.trajectories_dir)
 
-    # Create output filename with model name, steps, and timestamp
-    # Sanitize model name for filename (replace special characters)
-    safe_model_name = inference_model.replace('/', '_').replace(':', '_').replace(' ', '_')
-    input_data_name = input_file.split('/')[-1].split('.')[0]
-
-    output_file = output_dir / f"inference_{input_data_name}_{safe_model_name}_{inference_mode}_step{step_num}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    prefix = experiment_file_prefix(
+        input_file, inference_model, inference_mode, step_num
+    )
+    output_file = select_output_file(output_dir, prefix, args.resume)
 
     # Print pipeline information
     logger.info("="*70)
@@ -573,6 +675,7 @@ Example usage:
     logger.info(f"Inference mode: {inference_mode} ({INFERENCE_MODES[inference_mode]['description']})")
     logger.info(f"Trajectory steps: {step_num if step_num > 0 else 'No trajectory (observation & instruction only)'}")
     logger.info(f"Concurrent workers: {num_workers}")
+    logger.info(f"Resume: {'enabled' if args.resume else 'disabled'}")
     logger.info("="*70)
 
     # Load dataset
@@ -586,6 +689,36 @@ Example usage:
         dataset = dataset[:NUM_INSTANCES_TO_PROCESS]
         logger.info(f"   ℹ️  Processing only first {len(dataset)} instances")
 
+    dataset_ids = {instance['id'] for instance in dataset}
+    results_by_id = (
+        load_completed_results(output_file, inference_mode, dataset_ids)
+        if args.resume
+        else {}
+    )
+    pending_dataset = [
+        instance for instance in dataset if instance['id'] not in results_by_id
+    ]
+    resumed_count = len(results_by_id)
+
+    # Rewrite through the atomic path once before processing. This deduplicates
+    # legacy result files and creates an empty, resumable file for a new run.
+    ordered_results = [
+        results_by_id[instance['id']]
+        for instance in dataset
+        if instance['id'] in results_by_id
+    ]
+    atomic_write_json(output_file, ordered_results)
+    if resumed_count:
+        logger.info(
+            f"   ↩️  Resuming with {resumed_count} completed instance(s); "
+            f"{len(pending_dataset)} remaining"
+        )
+
+    if not pending_dataset:
+        logger.info("   ✓ All instances are already complete; no API requests needed")
+        logger.info(f"\n📊 Inference results saved to: {output_file}")
+        return
+
     # Initialize OpenAI client
     if OpenAI is None:
         raise ModuleNotFoundError(
@@ -593,14 +726,10 @@ Example usage:
             "Install dependencies with: pip install -r requirements.txt"
         )
     client = OpenAI(base_url=base_url, api_key=api_key)
+    logger.info(f"   ✓ Result file ready: {output_file}")
 
-    # Initialize results file with empty list
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump([], f)
-    logger.info(f"   ✓ Initialized output file: {output_file}")
-
-    # Process instances concurrently. File updates are guarded so that every
-    # completed result is persisted immediately without concurrent JSON writes.
+    # Process missing instances concurrently. File updates are guarded and
+    # atomic so every completed result is immediately safe to resume from.
     success_count = 0
     failed_count = 0
     skipped_count = 0
@@ -617,11 +746,13 @@ Example usage:
         with file_lock:
             completed_count += 1
             if result:
-                with open(output_file, 'r', encoding='utf-8') as f:
-                    results = json.load(f)
-                results.append(result)
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    json.dump(results, f, indent=2, ensure_ascii=False)
+                results_by_id[instance['id']] = result
+                ordered_results = [
+                    results_by_id[item['id']]
+                    for item in dataset
+                    if item['id'] in results_by_id
+                ]
+                atomic_write_json(output_file, ordered_results)
                 success_count += 1
                 logger.info(f"💾 Saved result for {instance['id']}")
             elif error == "Trajectory file not found":
@@ -633,13 +764,16 @@ Example usage:
                     "instance_id": instance['id'],
                     "error": error
                 })
-            logger.info(f"Progress: {completed_count}/{len(dataset)} completed")
+            logger.info(
+                f"Progress: {completed_count}/{len(pending_dataset)} attempted "
+                f"this run; {len(results_by_id)}/{len(dataset)} saved overall"
+            )
 
     logger.info(f"\n🚀 Starting concurrent inference with {num_workers} workers...")
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         future_to_instance = {
             executor.submit(process_and_save, instance): instance
-            for instance in dataset
+            for instance in pending_dataset
         }
         for future in as_completed(future_to_instance):
             instance = future_to_instance[future]
@@ -658,9 +792,11 @@ Example usage:
     logger.info(f"\n{'='*70}")
     logger.info("INFERENCE COMPLETE")
     logger.info(f"{'='*70}")
-    logger.info(f"✓ Successful: {success_count}/{len(dataset)}")
-    logger.info(f"⏭️  Skipped (no trajectory): {skipped_count}/{len(dataset)}")
-    logger.info(f"✗ Failed: {failed_count}/{len(dataset)}")
+    logger.info(f"↩️  Previously completed: {resumed_count}/{len(dataset)}")
+    logger.info(f"✓ Newly successful: {success_count}/{len(pending_dataset)}")
+    logger.info(f"✓ Total saved: {len(results_by_id)}/{len(dataset)}")
+    logger.info(f"⏭️  Skipped (no trajectory): {skipped_count}/{len(pending_dataset)}")
+    logger.info(f"✗ Failed: {failed_count}/{len(pending_dataset)}")
 
     if skipped_instances:
         logger.info(f"\nSkipped instances (trajectory not found):")
@@ -674,6 +810,9 @@ Example usage:
 
     logger.info(f"\n📊 Inference results saved to: {output_file}")
     logger.info(f"   Use this file as input for evaluation.py to score the inferences")
+
+    if len(results_by_id) < len(dataset):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
