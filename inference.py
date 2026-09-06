@@ -53,8 +53,10 @@ base_url = os.environ.get('OPENAI_BASE_URL', 'http://localhost:8080/v1')
 NUM_INSTANCES_TO_PROCESS = None
 
 # Timeout and retry configuration
-TIMEOUT_SECONDS = 180
+TIMEOUT_SECONDS = int(os.environ.get('INFERENCE_TIMEOUT_SECONDS', '120'))
 MAX_RETRIES = 2
+REASONING_EFFORT = os.environ.get('INFERENCE_REASONING_EFFORT', '')
+MAX_OUTPUT_TOKENS = int(os.environ.get('INFERENCE_MAX_OUTPUT_TOKENS', '0'))
 
 # Create inference directory (relative path)
 inference_dir = Path("inference_results")
@@ -428,18 +430,34 @@ def run_inference(
         try:
             logger.info(f"   🔄 Attempt {attempt}/{MAX_RETRIES}")
 
+            request_options = {}
+            openai_reasoning = inference_model.startswith(('gpt-5', 'gpt-6', 'o1', 'o3', 'o4'))
+            if REASONING_EFFORT:
+                if openai_reasoning:
+                    request_options['reasoning_effort'] = REASONING_EFFORT
+                else:
+                    request_options['extra_body'] = {'chat_template_kwargs': {
+                        'enable_thinking': True, 'reasoning_effort': REASONING_EFFORT}}
+            if MAX_OUTPUT_TOKENS:
+                token_parameter = 'max_completion_tokens' if openai_reasoning else 'max_tokens'
+                request_options[token_parameter] = MAX_OUTPUT_TOKENS
+            if not (openai_reasoning and REASONING_EFFORT):
+                request_options['temperature'] = 0.0
             inference_response = client.chat.completions.create(
                 model=inference_model,
                 messages=messages,
-                temperature=0.0,
-                timeout=TIMEOUT_SECONDS
+                timeout=TIMEOUT_SECONDS,
+                **request_options,
             )
 
             response_text = inference_response.choices[0].message.content
-            logger.debug(f"   Raw inference response: {response_text[:1000]}")
+            logger.debug(f"   Raw inference response: {(response_text or '')[:1000]}")
 
             # Extract JSON from response (handles markdown code blocks and incomplete JSON)
             try:
+                if not response_text:
+                    raise ValueError('Empty final answer; finish_reason=' + str(
+                        inference_response.choices[0].finish_reason))
                 result = validate_inference_result(
                     extract_json_from_text(response_text), inference_mode
                 )
@@ -725,7 +743,11 @@ Example usage:
             "The 'openai' package is required to run inference. "
             "Install dependencies with: pip install -r requirements.txt"
         )
-    client = OpenAI(base_url=base_url, api_key=api_key)
+    client = OpenAI(base_url=base_url, api_key=api_key,
+                    max_retries=int(os.environ.get('INFERENCE_SDK_RETRIES', '2')))
+    logger.info('Generation settings: reasoning=%s, max_tokens=%s, timeout=%ss',
+                REASONING_EFFORT or 'server default', MAX_OUTPUT_TOKENS or 'server default',
+                TIMEOUT_SECONDS)
     logger.info(f"   ✓ Result file ready: {output_file}")
 
     # Process missing instances concurrently. File updates are guarded and
